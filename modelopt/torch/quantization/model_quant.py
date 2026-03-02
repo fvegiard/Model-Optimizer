@@ -33,10 +33,12 @@ from modelopt.torch.quantization.conversion import set_quantizer_by_cfg
 from modelopt.torch.utils import atomic_print
 
 from .algorithms import AutoQuantizeGradientSearcher, AutoQuantizeKLDivSearcher, QuantRecipe
+from .algorithms import get_auto_quantize_config as _get_auto_quantize_config
 from .config import QuantizeAlgoCfgType
 from .conversion import set_quantizer_attribute
 from .mode import QuantizeModeRegistry, get_modelike_from_algo_cfg
 from .nn import QuantModule, TensorQuantizer
+from .utils import is_quantized
 
 __all__ = [
     "auto_quantize",
@@ -44,6 +46,7 @@ __all__ = [
     "disable_quantizer",
     "enable_quantizer",
     "fold_weight",
+    "get_auto_quantize_config",
     "postprocess_amax",
     "print_quant_summary",
     "quantize",
@@ -145,6 +148,9 @@ def quantize(
     performs calibration as specified by ``quant_cfg``.
     ``forward_loop`` is used to forward data through the model and gather statistics for calibration.
 
+    If the model is already quantized, the provided ``config`` is applied to the existing
+    quantizers and calibration is run.
+
     Args:
         model: A pytorch model
         config: A dictionary or an instance of
@@ -228,7 +234,12 @@ def quantize(
 
     Returns: A pytorch model which has been quantized and calibrated.
     """
-    model = apply_mode(model, mode=[("quantize", config)], registry=QuantizeModeRegistry)
+    if not is_quantized(model):
+        model = apply_mode(model, mode=[("quantize", dict(config))], registry=QuantizeModeRegistry)
+    else:
+        # Already quantized, so lets apply the quant_cfg from the config
+        quant_cfg = QuantizeConfig(**dict(config)).quant_cfg
+        set_quantizer_by_cfg(model, quant_cfg)
     return calibrate(model, config.get("algorithm"), forward_loop=forward_loop)
 
 
@@ -495,6 +506,45 @@ def auto_quantize(
     searcher.search(model, constraints, config=search_config)  # type: ignore[arg-type]
 
     return model, searcher.state_dict()
+
+
+def get_auto_quantize_config(search_state, constraints=None, verbose=False):
+    """Build a flat quant config from auto_quantize search_state.
+
+    Re-solves for ``constraints`` if provided, otherwise uses the stored best recipe.
+
+    Args:
+        search_state: The state dict returned by :func:`auto_quantize`.
+        constraints: Optional dict, e.g. ``{"effective_bits": 5.5}``, to re-solve for a
+            different target without re-running calibration or scoring.
+        verbose: If True, prints the per-layer recipe assignments.
+
+    Returns:
+        A config dict suitable for :func:`quantize`.
+
+    Example:
+
+        .. code-block:: python
+
+            model, search_state = mtq.auto_quantize(model, ...)
+
+            # Re-solve for a different effective_bits target (cheap, no GPU needed)
+            config = mtq.get_auto_quantize_config(search_state, {"effective_bits": 5.5})
+
+            # Or use the original result
+            config = mtq.get_auto_quantize_config(search_state)
+
+            # [Optional] Customize algorithm if needed
+            config["algorithm"] = {"method": "mse", "fp8_scale_sweep": True}
+
+            # Reuse on the same model (e.g. run a longer calibration pass)
+            model = mtq.quantize(model, config, forward_loop=calibrate_loop)
+
+            # Or apply the same/customized config on a fresh model instance
+            # fresh_model = load_model(...)
+            # fresh_model = mtq.quantize(fresh_model, config, forward_loop=calibrate_loop)
+    """
+    return _get_auto_quantize_config(search_state, constraints, verbose=verbose)
 
 
 def disable_quantizer(model: nn.Module, wildcard_or_filter_func: str | Callable):
